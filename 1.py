@@ -1,169 +1,107 @@
-import gzip
-import shutil
-import xml.etree.ElementTree as ET
+import os
 
-from db import ExtraJudicialBankruptcyMessage, ObligatoryPayment, MonetaryObligation, Bank, Session, Debtor, Publisher
+from web3 import Web3
+import requests
+from flask import Flask, request, jsonify
+from dotenv import load_dotenv
+load_dotenv()
 
-with gzip.open('ExtrajudicialData.xml.gz', 'rb') as f_in:
-    with open('ExtrajudicialBankruptcy_20230808_2.xml', 'wb') as f_out:
-        shutil.copyfileobj(f_in, f_out)
+web3 = Web3(Web3.HTTPProvider('https://polygon-rpc.com/'))
+erc20_abi = [
+    {
+        "constant": True,
+        "inputs": [{"name": "_owner", "type": "address"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "balance", "type": "uint256"}],
+        "payable": False,
+        "stateMutability": "view",
+        "type": "function"
+    }
+]
 
-tree = ET.parse('ExtrajudicialBankruptcy_20230808_2.xml')
-root = tree.getroot()
+token_contract_address = os.getenv('TOKEN_CONTRACT_ADDRESS')
+api_key = os.getenv('API_KEY')
+polygonscan_api_url = os.getenv('API_URL')
 
-session = Session()
+token_address = Web3.to_checksum_address(token_contract_address)
+token_contract = web3.eth.contract(address=token_address, abi=erc20_abi)
 
-for xml_message in root.findall('ExtrajudicialBankruptcyMessage'):
-    message_id = xml_message.find('Id').text
-    number = int(xml_message.find('Number').text)
-    type_ = xml_message.find('Type').text
-    publish_date = xml_message.find('PublishDate').text
-    finish_reason = xml_message.find('FinishReason').text if xml_message.find('FinishReason') is not None else None
 
-    message = ExtraJudicialBankruptcyMessage(
-        id=message_id,
-        number=number,
-        type=type_,
-        publish_date=publish_date,
-        finish_reason=finish_reason,
-    )
-    session.add(message)
+app = Flask(__name__)
 
-    debtor = xml_message.find('Debtor')
-    debtor_name = debtor.find('Name').text
-    debtor_birth_date = debtor.find('BirthDate').text
-    debtor_birth_place = debtor.find('BirthPlace').text
-    debtor_address = debtor.find('Address').text
-    debtor_inn = int(debtor.find('Inn').text) if debtor.find('Inn') is not None else None
 
-    debtor = session.query(Debtor).filter_by(
-        name=debtor_name, birth_date=debtor_birth_date, birth_place=debtor_birth_place
-    ).first()
-    debtor = Debtor(
-        name=debtor_name,
-        birth_date=debtor_birth_date,
-        birth_place=debtor_birth_place,
-        inn=debtor_inn
-    ) if debtor is None else debtor
-    message.debtor = debtor
+def fetch_token_holders(api_key, contract_address):
+    url = f"{polygonscan_api_url}?module=account&action=tokenholderlist&contractaddress={contract_address}" \
+          f"&apikey={api_key}"
+    holders = []
 
-    publisher = xml_message.find('Publisher')
-    publisher_name = publisher.find('Name').text
-    publisher_inn = int(publisher.find('Inn').text)
-    publisher_ogrn = int(publisher.find('Ogrn').text)
+    page = 1
+    while True:
+        response = requests.get(f"{url}&page={page}&offset=1000")
+        data = response.json()
+        if data['status'] == '1' and data['result']:
+            holders.extend(data['result'])
+            page += 1
+        else:
+            break
+    return holders
 
-    publisher = session.query(Publisher).filter_by(inn=publisher_inn).first()
-    publisher = Publisher(
-        name=publisher_name,
-        inn=publisher_inn,
-        ogrn=publisher_ogrn
-    ) if publisher is None else publisher
-    message.publisher = publisher
 
-    banks = xml_message.find('Banks')
-    if banks is not None:
-        for bank in banks.findall('Bank'):
-            bank_name = bank.find('Name').text
-            bank_bik = int(bank.find('Bik').text) if bank.find('Bik') else None
-            bank_obj = session.query(Bank).filter_by(name=bank_name).first()
-            if bank_obj is None:
-                bank_obj = Bank(
-                    name=bank_name,
-                    bik=bank_bik,
-                )
-                session.add(bank_obj)
-                session.commit()
-            message.banks.append(bank_obj)
+def get_last_transaction(api_key, address):
+    url = f"{polygonscan_api_url}?module=account&action=txlist&address={address}&sort=desc&apikey={api_key}"
+    response = requests.get(url)
+    data = response.json()
+    if data['status'] == '1' and data['result']:
+        return data['result'][0]['timeStamp']  # Assuming the first transaction is the most recent
+    return "No transactions found"
 
-    creditors_from_entrepreneurship = xml_message.find('CreditorsFromEntrepreneurship')
 
-    if creditors_from_entrepreneurship is not None:
-        monetary_obligations = creditors_from_entrepreneurship.find('MonetaryObligations')
-        obligatory_payments = creditors_from_entrepreneurship.find('ObligatoryPayments')
-    else:
-        monetary_obligations = None
-        obligatory_payments = None
+@app.route('/get_balance', methods=['GET'])
+def get_balance():
+    address = request.args.get('address')
+    address = Web3.to_checksum_address(address)
+    balance = token_contract.functions.balanceOf(address).call()
+    return jsonify({'balance': balance})
 
-    for monetary_obligation in monetary_obligations.findall('MonetaryObligation') if monetary_obligations else []:
-        monetary_obligation_creditor_name = monetary_obligation.find('CreditorName').text
-        monetary_obligation_content = monetary_obligation.find('Content').text
-        monetary_obligation_basis = monetary_obligation.find('Basis').text
-        monetary_obligation_total_sum = monetary_obligation.find('TotalSum')
-        if monetary_obligation_total_sum is not None:
-            monetary_obligation_total_sum = float(monetary_obligation_total_sum.text)
 
-        monetary_obligation_debt_sum = monetary_obligation.find('DebtSum')
-        if monetary_obligation_debt_sum is not None:
-            monetary_obligation_debt_sum = float(monetary_obligation_debt_sum.text)
+@app.route('/get_balance_batch', methods=['POST'])
+def get_balance_batch():
+    addresses = request.json.get('addresses', [])
+    balances = []
+    for address in addresses:
+        checksum_address = Web3.to_checksum_address(address)
+        balance = token_contract.functions.balanceOf(checksum_address).call()
+        balances.append(balance)
+    balances = []
+    return jsonify({'balances': balances})
 
-        monetary_obligation_obj = MonetaryObligation(
-            creditor_name=monetary_obligation_creditor_name,
-            content=monetary_obligation_content,
-            basis=monetary_obligation_basis,
-            total_sum=monetary_obligation_total_sum,
-            debt_sum=monetary_obligation_debt_sum,
-            message_id=message_id,
-            from_entrepreneurship=True,
-        )
-        session.add(monetary_obligation_obj)
-        message.monetary_obligations.append(monetary_obligation_obj)
 
-    for obligatory_payment in obligatory_payments.findall('ObligatoryPayment') if obligatory_payments else []:
-        obligatory_payment_name = obligatory_payment.find('Name').text
-        obligatory_payment_sum = float(obligatory_payment.find('Sum').text)
+@app.route('/get_top', methods=['GET'])
+def get_top():
+    n = request.json.get('n', 10)
+    holders = fetch_token_holders(api_key, token_contract_address)
+    sorted_holders = sorted(holders, key=lambda x: int(x['balance']), reverse=True)
+    return jsonify(sorted_holders[:n])
 
-        obligatory_payment_obj = ObligatoryPayment(
-            name=obligatory_payment_name,
-            sum=obligatory_payment_sum,
-            message_id=message_id,
-            from_entrepreneurship=True
-        )
-        message.obligatory_payments.append(obligatory_payment_obj)
-        session.add(obligatory_payment_obj)
 
-    creditors_non_from_entrepreneurship = xml_message.find('CreditorsNonFromEntrepreneurship')
-    if creditors_non_from_entrepreneurship is not None:
-        monetary_obligations = creditors_non_from_entrepreneurship.find('MonetaryObligations')
-        obligatory_payments = creditors_non_from_entrepreneurship.find('ObligatoryPayments')
-    else:
-        monetary_obligations = None
-        obligatory_payments = None
+@app.route('/get_top_with_transactions', methods=['GET'])
+def get_top_with_transactions():
+    n = request.json.get('n', 10)
+    holders = fetch_token_holders(api_key, token_contract_address)
+    sorted_holders = sorted(holders, key=lambda x: int(x['balance']), reverse=True)
+    for holder in sorted_holders[:n]:
+        last_transaction = get_last_transaction(api_key, holder['account'])
+        holder['last_transaction'] = last_transaction
+    return jsonify(sorted_holders[:n])
 
-    for monetary_obligation in monetary_obligations.findall('MonetaryObligation') if monetary_obligations else []:
-        monetary_obligation_creditor_name = monetary_obligation.find('CreditorName').text
-        monetary_obligation_content = monetary_obligation.find('Content').text
-        monetary_obligation_basis = monetary_obligation.find('Basis').text
-        monetary_obligation_total_sum = monetary_obligation.find('TotalSum')
-        if monetary_obligation_total_sum is not None:
-            monetary_obligation_total_sum = float(monetary_obligation_total_sum.text)
 
-        monetary_obligation_debt_sum = monetary_obligation.find('DebtSum')
-        if monetary_obligation_debt_sum is not None:
-            monetary_obligation_debt_sum = float(monetary_obligation_debt_sum.text)
+@app.route('/get_token_info', methods=['GET'])
+def get_token_info():
+    url = f"{polygonscan_api_url}?module=token&action=tokeninfo&contractaddress={token_contract_address}" \
+          f"&apikey={api_key}"
+    response = requests.get(url)
+    return jsonify(response.json())
 
-        monetary_obligation_obj = MonetaryObligation(
-            creditor_name=monetary_obligation_creditor_name,
-            content=monetary_obligation_content,
-            basis=monetary_obligation_basis,
-            total_sum=monetary_obligation_total_sum,
-            debt_sum=monetary_obligation_debt_sum,
-            message_id=message_id,
-            from_entrepreneurship=True,
-        )
-        message.monetary_obligations.append(monetary_obligation_obj)
-        session.add(monetary_obligation_obj)
 
-    for obligatory_payment in obligatory_payments.findall('ObligatoryPayment') if obligatory_payments else []:
-        obligatory_payment_name = obligatory_payment.find('Name').text
-        obligatory_payment_sum = float(obligatory_payment.find('Sum').text)
-
-        obligatory_payment_obj = ObligatoryPayment(
-            name=obligatory_payment_name,
-            sum=obligatory_payment_sum,
-            message_id=message_id,
-            from_entrepreneurship=False,
-        )
-        message.obligatory_payments.append(obligatory_payment_obj)
-        session.add(obligatory_payment_obj)
-
-session.commit()
+if __name__ == '__main__':
+    app.run(debug=True, host='0.0.0.0', port=8080)
