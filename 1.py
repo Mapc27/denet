@@ -52,7 +52,7 @@ def get_last_transaction(api_key, address):
     response = requests.get(url)
     data = response.json()
     if data['status'] == '1' and data['result']:
-        return data['result'][0]['timeStamp']  # Assuming the first transaction is the most recent
+        return data['result'][0]['timeStamp']
     return "No transactions found"
 
 
